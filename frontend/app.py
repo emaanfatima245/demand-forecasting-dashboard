@@ -6,13 +6,18 @@ Run:
 
 Environment variables:
     API_BASE_URL         Base URL of the FastAPI server (default http://127.0.0.1:8000)
-    API_FORECAST_PATH    Route of the forecast endpoint (default /forecast). The endpoint in
-                         the contract was cut off after the host, so set this variable if
-                         your route is different.
-    API_TIMEOUT_SECONDS  Request timeout in seconds (default 30)
+    API_FORECAST_PATH    Route of the forecast endpoint (default /predict). Set this
+                         variable if your route is different.
+    API_TIMEOUT_SECONDS  Kept for compatibility (the API is tried first with a short
+                         timeout, then the app falls back to the local model)
+
+Data source:
+    1. The FastAPI backend is tried first.
+    2. If it is unreachable (for example on Streamlit Community Cloud), the app loads
+       backend/model.joblib and data/train.csv directly and predicts locally.
 
 Requirements:
-    streamlit>=1.39 (keyed containers), plotly, pandas, requests
+    streamlit>=1.39 (keyed containers), plotly, pandas, requests, joblib, xgboost
 
 Recommended .streamlit/config.toml so native widgets such as the dataframe match the
 light editorial theme:
@@ -25,8 +30,11 @@ from __future__ import annotations
 import html
 import os
 import re
+from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
+import joblib
 import pandas as pd
 import plotly.graph_objects as go
 import requests
@@ -38,6 +46,10 @@ import streamlit as st
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 FORECAST_PATH = "/" + os.getenv("API_FORECAST_PATH", "/predict").lstrip("/")
 REQUEST_TIMEOUT = float(os.getenv("API_TIMEOUT_SECONDS", "30"))
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_PATH = BASE_DIR / "data" / "train.csv"
+MODEL_PATH = BASE_DIR / "backend" / "model.joblib"
 
 NAVY = "#001b44"
 NAVY_ACTIVE = "#002f6c"
@@ -386,61 +398,55 @@ def show_dataframe(data: pd.DataFrame, height: int) -> None:
 
 
 # ----------------------------------------------------------------------------
-# API access
+# Data access (FastAPI first, local model fallback)
 # ----------------------------------------------------------------------------
-def _extract_detail(response: requests.Response | None) -> str:
-    if response is None:
-        return ""
-    try:
-        body = response.json()
-    except ValueError:
-        return response.text[:200].strip()
-    detail = body.get("detail") if isinstance(body, dict) else None
-    if isinstance(detail, str):
-        return detail
-    if isinstance(detail, list):
-        messages = [str(item.get("msg", "")) for item in detail if isinstance(item, dict)]
-        return "; ".join(m for m in messages if m)
-    return ""
+@st.cache_resource
+def load_local_assets():
+    model = joblib.load(MODEL_PATH)
+    df = pd.read_csv(DATA_PATH)
+    df["date"] = pd.to_datetime(df["date"])
+    return model, df
 
 
-def fetch_forecast(
-    store_id: int, item_id: int, days_ahead: int
-) -> tuple[dict[str, Any] | None, str | None]:
-    """Call the live backend. Returns (data, None) on success or (None, error_message)."""
-    url = f"{API_BASE_URL}{FORECAST_PATH}"
-    params = {"store_id": store_id, "item_id": item_id, "days_ahead": days_ahead}
+def get_forecast_data(store_id: int, item_id: int, days_ahead: int) -> dict:
+    # 1. Try local FastAPI backend first
     try:
-        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        return response.json(), None
-    except requests.exceptions.ConnectionError:
-        return None, (
-            "**The forecast API appears to be offline.**\n\n"
-            f"Could not connect to `{url}`. Start your FastAPI server, make sure "
-            "`API_BASE_URL` points to it, then select **Run Forecast** again."
+        resp = requests.get(
+            f"{API_BASE_URL}{FORECAST_PATH}",
+            params={"store_id": store_id, "item_id": item_id, "days_ahead": days_ahead},
+            timeout=2,
         )
-    except requests.exceptions.Timeout:
-        return None, (
-            f"**The forecast API took too long to respond** (more than {REQUEST_TIMEOUT:g} seconds). "
-            "Try again in a moment or choose a shorter horizon."
-        )
-    except requests.exceptions.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else "unknown"
-        detail = _extract_detail(exc.response)
-        message = f"**The API returned an error (HTTP {status}).**"
-        if detail:
-            message += f"\n\n{detail}"
-        if status == 404:
-            message += (
-                f"\n\nCheck that the route `{FORECAST_PATH}` exists on `{API_BASE_URL}`. "
-                "You can change it with the `API_FORECAST_PATH` environment variable."
-            )
-        return None, message
-    except ValueError:
-        return None, "**The API replied, but the response was not valid JSON.**"
-    except requests.exceptions.RequestException as exc:
-        return None, f"**Something went wrong while calling the API.**\n\n{exc}"
+        if resp.status_code == 200:
+            return resp.json()
+    except requests.exceptions.RequestException:
+        pass
+
+    # 2. Fallback to direct XGBoost inference for Streamlit Community Cloud
+    model, df = load_local_assets()
+    history = df[(df["store"] == store_id) & (df["item"] == item_id)].sort_values("date").tail(60)
+    max_date = df["date"].max()
+    future_dates = [max_date + timedelta(days=i) for i in range(1, days_ahead + 1)]
+    future_df = pd.DataFrame({
+        "store": store_id,
+        "item": item_id,
+        "year": [d.year for d in future_dates],
+        "month": [d.month for d in future_dates],
+        "day": [d.day for d in future_dates],
+        "day_of_week": [d.weekday() for d in future_dates],
+    })
+    preds = model.predict(future_df)
+    return {
+        "store_id": store_id,
+        "item_id": item_id,
+        "history": [
+            {"date": d.strftime("%Y-%m-%d"), "sales": float(s)}
+            for d, s in zip(history["date"], history["sales"])
+        ],
+        "forecast": [
+            {"date": d.strftime("%Y-%m-%d"), "predicted_sales": round(float(p), 2)}
+            for d, p in zip(future_dates, preds)
+        ],
+    }
 
 
 def parse_payload(data: Any) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -697,15 +703,17 @@ def render_sidebar() -> tuple[int, int, int, bool]:
 
 
 def run_forecast(store_id: int, item_id: int, days_ahead: int) -> None:
-    with st.spinner("Running demand forecast..."):
-        data, error = fetch_forecast(store_id, item_id, days_ahead)
-
+    error: str | None = None
     hist = fc = None
-    if error is None:
+
+    with st.spinner("Running demand forecast..."):
         try:
+            data = get_forecast_data(store_id, item_id, days_ahead)
             hist, fc = parse_payload(data)
         except ValueError as exc:
             error = f"**The API response could not be used.**\n\n{exc}"
+        except Exception as exc:  # local model or data files could not be used
+            error = f"**The forecast could not be generated.**\n\n{exc}"
 
     if error is not None:
         st.session_state.payload = None
