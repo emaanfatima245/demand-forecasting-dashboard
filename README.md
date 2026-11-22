@@ -8,6 +8,12 @@ An end-to-end machine learning web application that predicts future product sale
 <img width="1298" height="429" alt="image" src="https://github.com/user-attachments/assets/fcdf8158-ca19-4a66-b5a5-070a9a50821f" />
 
 
+## Live Demo
+
+
+
+https://retail-demand-forecast-emaan.streamlit.app/
+
 ## Features
 * **Multi-Store & Item Forecasting:** Predicts daily product demand from 7 up to 90 days ahead.
 * **RESTful ML API:** FastAPI backend serving real-time JSON predictions from a pre-trained XGBoost model (`model.joblib`).
